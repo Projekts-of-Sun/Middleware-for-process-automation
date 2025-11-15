@@ -1,0 +1,683 @@
+#include "stdafx.h"
+#include "Service ClientDlg.h"
+#include "..\..\utf8\utf8.h"
+#include "..\..\Service Interface\Method Command.h"
+#include "..\..\Service Interface\Abort Command.h"
+
+#ifndef NDEBUG
+	#define new DEBUG_NEW
+#endif
+
+using namespace boost;
+using namespace MassHunter;
+
+CServiceClientDlg::CServiceClientDlg(CWnd* pParent /*=NULL*/)
+	: CDialog(CServiceClientDlg::IDD, pParent)
+	, Shutdown(false)
+{
+	m_hIcon = AfxGetApp()->LoadIcon(IDR_MAINFRAME);
+	MassHunter.ServerIP = AfxGetApp()->GetProfileString(L"Config-Sami-Service", L"IP", L"localhost");
+	MassHunter.ServerPort = AfxGetApp()->GetProfileInt(L"Config-Sami-Service", L"Port", 9002);
+}
+
+void CServiceClientDlg::DoDataExchange(CDataExchange* pDX)
+{
+	CDialog::DoDataExchange(pDX);
+	DDX_Text(pDX, IDC_SERVER_IP, MassHunter.ServerIP);
+	DDX_Text(pDX, IDC_SERVER_PORT, MassHunter.ServerPort);
+	DDX_Control(pDX, IDC_PROJECT_LIST, ProjectList);
+	DDX_Control(pDX, IDC_MASTERBATCH_LIST, MasterBatchList);
+	DDX_Control(pDX, IDC_METHOD_LIST, MethodList);
+	DDX_Control(pDX, IDC_STATUS_BOX, m_StatusBox);
+
+}
+
+BEGIN_MESSAGE_MAP(CServiceClientDlg, CDialog)
+	ON_BN_CLICKED(IDC_SERVER_CONNECT, &CServiceClientDlg::OnBnClickedServerConnect)
+	ON_BN_CLICKED(IDC_SERVER_DISCONNECT, &CServiceClientDlg::OnBnClickedServerDisconnect)
+	ON_BN_CLICKED(IDC_LIST_PROJECTS, &CServiceClientDlg::OnBnClickedListProjects)
+	ON_BN_CLICKED(IDC_LIST_MASTERBATCHES, &CServiceClientDlg::OnBnClickedListMasterBatches)
+	ON_BN_CLICKED(IDC_RUN_MASTERBATCH, &CServiceClientDlg::OnBnClickedRunMasterBatch)
+	ON_BN_CLICKED(IDC_LIST_METHODS, &CServiceClientDlg::OnBnClickedListMethods)
+	ON_BN_CLICKED(IDC_ABORT, &CServiceClientDlg::OnBnClickedAbort)
+	ON_BN_CLICKED(IDC_RUN_METHOD, &CServiceClientDlg::OnBnClickedRunMethod)
+
+	ON_MESSAGE(MSG_INFO_TEXT, &CServiceClientDlg::OnInfoText)
+	ON_BN_CLICKED(IDC_GET_STATUS, &CServiceClientDlg::OnBnClickedGetStatus)
+
+END_MESSAGE_MAP()
+
+
+BOOL CServiceClientDlg::OnInitDialog()
+{
+	CDialog::OnInitDialog();
+
+	SetIcon(m_hIcon, TRUE);
+
+	CRect R;
+	ProjectList.GetClientRect(&R);
+	ProjectList.InsertColumn(0, L"Projects", LVCFMT_LEFT, R.Width() - 16);
+	MasterBatchList.GetClientRect(&R);
+	MasterBatchList.InsertColumn(0, L"Master Batches", LVCFMT_LEFT, R.Width() - 16);
+	MethodList.GetClientRect(&R);
+	MethodList.InsertColumn(0, L"Methods", LVCFMT_LEFT, R.Width() - 16);
+	return TRUE;
+}
+
+void CServiceClientDlg::OnOK()
+{
+	Shutdown = true;
+	OnBnClickedServerDisconnect();
+
+	CDialog::OnOK();
+}
+
+void CServiceClientDlg::SetInfoText(CString Text)
+{
+	SetDlgItemText(IDC_INFO_TEXT, Text);
+}
+
+void CServiceClientDlg::SetInfoTextExtern(CString Text)
+{
+	if (Shutdown) return;
+	CString* T = new CString(Text);
+	PostMessage(MSG_INFO_TEXT, WPARAM(T));
+}
+
+LRESULT CServiceClientDlg::OnInfoText(WPARAM wParam, LPARAM /*lParam*/)
+{
+	CString* T = (CString*)wParam;
+	if (!T) return 0;
+	SetDlgItemText(IDC_INFO_TEXT, *T);
+	delete T;
+	return 0;
+}
+
+
+void CServiceClientDlg::OnBnClickedServerConnect()
+{
+	TRACE(L"CServiceClientDlg::OnBnClickedServerConnect\n");
+	SetInfoText(L"Connecting ..");
+	OnBnClickedServerDisconnect();
+
+	UpdateData();
+	AfxGetApp()->WriteProfileString(L"Config-Sami-Service", L"IP", MassHunter.ServerIP);
+	AfxGetApp()->WriteProfileInt(L"Config-Sami-Service", L"Port", MassHunter.ServerPort);
+
+	interprocess::scoped_lock<recursive_mutex> SL(m_Mutex);
+	MassHunter.IoService.reset(new asio::io_service());
+	MassHunter.Peer.reset(new CMassHunterPeerConnection(MassHunter.IoService, MassHunter.ServerIP, MassHunter.ServerPort, AfxGetApp()->m_pszAppName));
+	MassHunter.Peer->SetPeerActivateHandler(bind(&CServiceClientDlg::ActivateComplete, this, placeholders::_1, placeholders::_2));
+	MassHunter.Peer->SetPeerTimeoutHandler(bind(&CServiceClientDlg::PeerTimeout, this, placeholders::_1, placeholders::_2));
+	MassHunter.Peer->SetPeerErrorHandler(bind(&CServiceClientDlg::PeerError, this, placeholders::_1, placeholders::_2));
+	// first connect then run the io_service
+	// otherwise it will run out of operations and end
+	MassHunter.Peer->Connect();
+	MassHunter.Thread.reset(new thread(bind(&asio::io_service::run, MassHunter.IoService)));
+}
+
+void CServiceClientDlg::OnBnClickedServerDisconnect()
+{
+	TRACE(L"CServiceClientDlg::OnBnClickedServerDisconnect\n");
+	SetInfoText(L"Disconnecting ..");
+	if (MassHunter.Peer) MassHunter.Peer->Abort();
+	if (MassHunter.IoService)
+	{	while (!MassHunter.IoService->stopped())
+		{	TRACE(L"~");
+			Sleep(40);
+		}
+	}
+	if (MassHunter.Thread) MassHunter.Thread->join();
+	interprocess::scoped_lock<recursive_mutex> SL(m_Mutex);
+	MassHunter.Peer.reset();
+	MassHunter.Thread.reset();
+	MassHunter.IoService.reset();
+}
+
+void CServiceClientDlg::ActivateComplete(boost::system::error_code Error, CMassHunterPeerConnection* Peer)
+{
+	TRACE(L"CServiceClientDlg::ActivateComplete\n");
+	interprocess::scoped_lock<recursive_mutex> SL(m_Mutex);
+	if (Error)
+	{	SetInfoTextExtern(Utf8ToCString(Error.message()));
+		return;
+	}
+	_ASSERTE(Peer);
+	CString T;
+	T.Format(L"Connected to %s @ %s:%u", Peer->PeerName(), MassHunter.ServerIP, MassHunter.ServerPort);
+	SetInfoTextExtern(T);
+	OnBnClickedListProjects();
+}
+
+void CServiceClientDlg::PeerTimeout(boost::system::error_code Error, CMassHunterPeerConnection* Peer)
+{
+	TRACE(L"CServiceClientDlg::PeerTimeout\n");
+	interprocess::scoped_lock<recursive_mutex> SL(m_Mutex);
+	if (Error)
+	{	SetInfoTextExtern(Utf8ToCString(Error.message()));
+		return;
+	}
+	_ASSERTE(false);
+}
+
+void CServiceClientDlg::PeerError(boost::system::error_code Error, CMassHunterPeerConnection* Peer)
+{
+	TRACE(L"CServiceClientDlg::PeerError\n");
+	interprocess::scoped_lock<recursive_mutex> SL(m_Mutex);
+	if (Error)
+	{	SetInfoTextExtern(Utf8ToCString(Error.message()));
+		return;
+	}
+	_ASSERTE(false);
+}
+
+
+void CServiceClientDlg::OnBnClickedAbort()
+{
+	TRACE(L"CServiceClientDlg::OnBnClickedAbort\n");
+	if (!MassHunter.Peer) return;
+
+	SetInfoText(L"Request abort ..");
+	std::shared_ptr<CommandHandler::CBaseCommand> X(new CAbortCommand());
+	MassHunter.Peer->SendCommand(X, posix_time::seconds(10), std::bind(&CServiceClientDlg::AbortCommandComplete, this,
+																  std::placeholders::_1, std::placeholders::_2));
+}
+
+void CServiceClientDlg::OnBnClickedListProjects()
+{
+	TRACE(L"CServiceClientDlg::OnBnClickedListProjects\n");
+	if (!MassHunter.Peer) return;
+
+	SetInfoText(L"Request Project list ..");
+	std::shared_ptr<CommandHandler::CBaseCommand> X(new CResourceProjectsCommand());
+	CResourceProjectsCommand* Y = dynamic_cast<CResourceProjectsCommand*>(X.get());
+	Y->List.push_back(std::shared_ptr<CommandHandler::CBaseResourceInfo>
+											(new CommandHandler::CBaseResourceProjectInfo(CString(L"Instrument"))));
+	MassHunter.Peer->SendCommand(X, posix_time::seconds(10), std::bind(&CServiceClientDlg::ProjectListCommandComplete, this,
+																  std::placeholders::_1, std::placeholders::_2));
+}
+
+void CServiceClientDlg::OnBnClickedListMasterBatches()
+{
+	TRACE(L"CServiceClientDlg::OnBnClickedListMasterBatches\n");
+	if (!MassHunter.Peer) return;
+
+	SetInfoText(L"Request master batch list ..");
+	int Index = ProjectList.GetSelectionMark();
+	if (Index==-1)
+	{	SetInfoText(L"No Project selected");
+		return;
+	}
+	CString Project(ProjectList.GetItemText(Index, 0));
+
+	std::shared_ptr<CommandHandler::CBaseCommand> X(new CResourceMasterBatchesCommand());
+	CResourceMasterBatchesCommand* Y = dynamic_cast<CResourceMasterBatchesCommand*>(X.get());
+	Y->List.push_back(std::shared_ptr<CommandHandler::CBaseResourceInfo>
+											(new CommandHandler::CBaseResourceMasterBatchInfo(CString(L"Instrument"), Project)));
+	MassHunter.Peer->SendCommand(X, posix_time::seconds(10), std::bind(&CServiceClientDlg::MasterBatchListCommandComplete, this,
+																  std::placeholders::_1, std::placeholders::_2));
+}
+
+void CServiceClientDlg::OnBnClickedListMethods()
+{
+	TRACE(L"CServiceClientDlg::OnBnClickedListMethods\n");
+	if (!MassHunter.Peer) return;
+
+	SetInfoText(L"Request method list ..");
+	int Index = ProjectList.GetSelectionMark();
+	if (Index==-1)
+	{	SetInfoText(L"No Project selected");
+		return;
+	}
+	CString Project(ProjectList.GetItemText(Index, 0));
+
+	std::shared_ptr<CommandHandler::CBaseCommand> X(new CResourceMethodsCommand());
+	CResourceMethodsCommand* Y = dynamic_cast<CResourceMethodsCommand*>(X.get());
+	Y->List.push_back(std::shared_ptr<CommandHandler::CBaseResourceInfo>
+											(new CommandHandler::CBaseResourceMethodInfo(CString(L"Instrument"), Project)));
+	MassHunter.Peer->SendCommand(X, posix_time::seconds(10), bind(&CServiceClientDlg::MethodListCommandComplete, this,
+																  std::placeholders::_1, std::placeholders::_2));
+}
+
+void CServiceClientDlg::AbortCommandComplete(boost::system::error_code Error, CommandHandler::CCommandOnTheFly* X)
+{
+	TRACE(L"CServiceClientDlg::AbortCommandComplete\n");
+	interprocess::scoped_lock<recursive_mutex> SL(m_Mutex);
+
+	if (Error)
+	{
+		SetInfoTextExtern(Utf8ToCString(Error.message()));
+	}
+	if (!X || X->Responses.empty())
+	{	SetInfoTextExtern(L"No CommandHandler::CCommandOnTheFly object or no responses");
+		return;
+	}
+	SetInfoTextExtern(L"abort complete");
+}
+
+void CServiceClientDlg::ProjectListCommandComplete(boost::system::error_code Error, CommandHandler::CCommandOnTheFly* X)
+{
+	TRACE(L"CServiceClientDlg::ProjectListCommandComplete\n");
+	interprocess::scoped_lock<recursive_mutex> SL(m_Mutex);
+
+	if (Error)
+	{
+		SetInfoTextExtern(Utf8ToCString(Error.message()));
+	}
+	if (!X || X->Responses.empty())
+	{	SetInfoTextExtern(L"No CommandHandler::CCommandOnTheFly object or no responses");
+		return;
+	}
+	ProjectList.DeleteAllItemsExtern();
+
+	if (CResourceProjectsCommand* PC = dynamic_cast<CResourceProjectsCommand*>(X->Responses.front().get()))
+	{	if (PC->Success)
+		{	if (!PC->List.empty())
+			{	CommandHandler::CBaseResourceProjectInfo* PI = dynamic_cast<CommandHandler::CBaseResourceProjectInfo*>(PC->List.front().get());
+				for (std::list<CString>::const_iterator i(PI->Projects.begin());i!=PI->Projects.end();++i)
+				{	TRACE(L"\t%s\n", *i);
+					ProjectList.InsertItemExtern(0, *i);
+				}
+			}
+			else
+			{	SetInfoTextExtern(L"Empty Project list");
+			}
+		}
+		else
+		{	SetInfoTextExtern(PC->ErrorText);
+		}
+	}
+	SetInfoTextExtern(L"Project list complete");
+}
+
+void CServiceClientDlg::MasterBatchListCommandComplete(boost::system::error_code Error, CommandHandler::CCommandOnTheFly* X)
+{
+	TRACE(L"CServiceClientDlg::MasterBatchListCommandComplete\n");
+	interprocess::scoped_lock<recursive_mutex> SL(m_Mutex);
+
+	if (Error)
+	{
+		SetInfoTextExtern(Utf8ToCString(Error.message()));
+	}
+	if (!X || X->Responses.empty())
+	{	SetInfoTextExtern(L"No CommandHandler::CCommandOnTheFly object or no responses");
+		return;
+	}
+
+	MasterBatchList.DeleteAllItemsExtern();
+
+	if (CResourceMasterBatchesCommand* MBC = dynamic_cast<CResourceMasterBatchesCommand*>(X->Responses.front().get()))
+	{	if (MBC->Success)
+		{	if (!MBC->List.empty())
+			{	CommandHandler::CBaseResourceMasterBatchInfo* MBI = dynamic_cast<CommandHandler::CBaseResourceMasterBatchInfo*>(MBC->List.front().get());
+				for (std::list<CString>::const_iterator i(MBI->MasterBatches.begin());i!=MBI->MasterBatches.end();++i)
+				{	MasterBatchList.InsertItemExtern(0, *i);
+				}
+			}
+			else
+			{	SetInfoTextExtern(L"Empty Master Batch list");
+			}
+		}
+		else
+		{	SetInfoTextExtern(MBC->ErrorText);
+		}
+	}
+	SetInfoTextExtern(L"Master Batch list complete");
+}
+
+void CServiceClientDlg::MethodListCommandComplete(boost::system::error_code Error, CommandHandler::CCommandOnTheFly* X)
+{
+	TRACE(L"CServiceClientDlg::MethodListCommandComplete\n");
+	interprocess::scoped_lock<recursive_mutex> SL(m_Mutex);
+
+	if (Error)
+	{
+		SetInfoTextExtern(Utf8ToCString(Error.message()));
+	}
+	if (!X || X->Responses.empty())
+	{	SetInfoTextExtern(L"No CommandHandler::CCommandOnTheFly object or no responses");
+		return;
+	}
+
+	MethodList.DeleteAllItemsExtern();
+	if (CResourceMethodsCommand* MC = dynamic_cast<CResourceMethodsCommand*>(X->Responses.front().get()))
+	{	if (MC->Success)
+		{	if (!MC->List.empty())
+			{	CommandHandler::CBaseResourceMethodInfo* MI = dynamic_cast<CommandHandler::CBaseResourceMethodInfo*>(MC->List.front().get());
+				for (std::list<CString>::const_iterator i(MI->Methods.begin());i!=MI->Methods.end();++i)
+				{	MethodList.InsertItemExtern(0, *i);
+				}
+			}
+			else
+			{	SetInfoTextExtern(L"Empty Method list");
+			}
+		}
+		else
+		{	SetInfoTextExtern(MC->ErrorText);
+		}
+	}
+	SetInfoTextExtern(L"Method list complete");
+}
+
+void CServiceClientDlg::OnBnClickedRunMasterBatch()
+{
+	TRACE(L"CServiceClientDlg::OnBnClickedRunMasterBatch\n");
+	if (!MassHunter.Peer) return;
+
+	SetInfoText(L"Request master batch run ..");
+	int Index = ProjectList.GetSelectionMark();
+	if (Index==-1)
+	{	SetInfoText(L"No project selected");
+		return;
+	}
+	CString Project(ProjectList.GetItemText(Index, 0));
+	 Index = MasterBatchList.GetSelectionMark();
+	if (Index==-1)
+	{	SetInfoText(L"No master batch selected");
+		return;
+	}
+	CString MasterBatch(MasterBatchList.GetItemText(Index, 0));
+	CString DataPath(AfxGetApp()->m_pszAppName + CTime::GetCurrentTime().Format(L" %Y-%m-%d-%H-%M-%S.b"));
+
+	std::list<CommandHandler::CPositionData> Positions;
+	Positions.push_back(CommandHandler::CPositionData());
+	Positions.back().PositionName = L"P1";
+	Positions.back().Labware.push_back(CommandHandler::CLabwareData());
+	Positions.back().Labware.back().Barcode = L"XA-1234";
+	Positions.back().Labware.back().Name = L"Plate One";
+	std::shared_ptr<CommandHandler::CBaseCommand> X(new CMethodCommand(Project, MasterBatch, L"",
+			DataPath, Positions));
+	MassHunter.Peer->SendCommand(X, posix_time::seconds(10), std::bind(&CServiceClientDlg::MasterBatchRunCommandComplete, this,
+																  std::placeholders::_1, std::placeholders::_2));
+}
+
+void CServiceClientDlg::MasterBatchRunCommandComplete(boost::system::error_code Error, CommandHandler::CCommandOnTheFly* X)
+{
+	TRACE(L"CServiceClientDlg::MasterBatchRunCommandComplete\n");
+	interprocess::scoped_lock<recursive_mutex> SL(m_Mutex);
+
+	if (Error)
+	{
+		SetInfoTextExtern(Utf8ToCString(Error.message()));
+	}
+	if (!X || X->Responses.empty())
+	{	SetInfoTextExtern(L"No CommandHandler::CCommandOnTheFly object or no responses");
+		return;
+	}
+	// first response should be ACK/NACK second could by Reply ...
+	CommandHandler::CBaseError* E = dynamic_cast<CommandHandler::CBaseError*>(X->Responses.back().get());
+	if (E)
+	{	// TODO use ErrorCode
+		if (!E->ErrorText.IsEmpty())
+		{	SetInfoTextExtern(L"Server: " + E->ErrorText);
+		}
+		return;
+	}
+	CMethodCommand* Y = dynamic_cast<CMethodCommand*>(X->Responses.back().get());
+	if (!Y)
+	{	SetInfoTextExtern(L"No CMethodCommand object");
+		return;
+	}
+	if (Y->Success) SetInfoTextExtern(L"Method run complete");
+	else SetInfoTextExtern(L"Server: " + Y->ErrorText);
+}
+
+
+void CServiceClientDlg::OnBnClickedRunMethod()
+{
+	TRACE(L"CServiceClientDlg::OnBnClickedRunMethod\n");
+	if (!MassHunter.Peer) return;
+
+	SetInfoText(L"Request method run ..");
+	int Index = ProjectList.GetSelectionMark();
+	if (Index==-1)
+	{	SetInfoText(L"No project selected");
+		return;
+	}
+	CString Project(ProjectList.GetItemText(Index, 0));
+	 Index = MethodList.GetSelectionMark();
+	if (Index==-1)
+	{	SetInfoText(L"No method selected");
+		return;
+	}
+	CString Method(MethodList.GetItemText(Index, 0));
+	//CString DataPath(AfxGetApp()->m_pszAppName + CTime::GetCurrentTime().Format(L" %Y-%m-%d-%H-%M-%S.b"));
+	CString DataPath(L"");
+
+	std::list<CommandHandler::CPositionData> Positions;
+	Positions.push_back(CommandHandler::CPositionData());
+	Positions.back().PositionName = L"1";
+	Positions.back().Labware.push_back(CommandHandler::CLabwareData());
+	Positions.back().Labware.back().Barcode = L"XA-1234";
+	Positions.back().Labware.back().Name = L"Plate One";
+	Positions.back().Labware.back().SampleName = L"GC Probe1";
+	Positions.back().Labware.back().Vial = L"8";
+	Positions.back().Labware.back().Method_Path = L"C:\\MassHunter\\GCMS\\1\\methods";
+	Positions.back().Labware.back().Typ = L"Sample";
+	Positions.back().Labware.back().DataFile = L"";
+	Positions.back().Labware.back().Level = L"";
+	Positions.back().Labware.back().Dilution = L"1";
+	Positions.back().Labware.back().Volume = L"";
+	Positions.back().Labware.back().TrayName = L"";
+	Positions.back().Labware.back().Comment = L"";
+
+	
+	Positions.push_back(CommandHandler::CPositionData());
+	Positions.back().PositionName = L"2";
+	Positions.back().Labware.push_back(CommandHandler::CLabwareData());
+	Positions.back().Labware.back().Barcode = L"Reihe 2";
+	Positions.back().Labware.back().Name = L"Plate 2";
+	Positions.back().Labware.back().SampleName = L"GC Probe2";
+	Positions.back().Labware.back().Vial = L"9";
+	Positions.back().Labware.back().Method_Path = L"C:\\MassHunter\\GCMS\\1\\methods";
+	Positions.back().Labware.back().Typ = L"Cal";
+	Positions.back().Labware.back().DataFile = L"";
+	Positions.back().Labware.back().Level = L"1";
+	Positions.back().Labware.back().Dilution = L"1";
+	Positions.back().Labware.back().Volume = L"";
+	Positions.back().Labware.back().TrayName = L"";
+	Positions.back().Labware.back().Comment = L"";
+	
+	Positions.push_back(CommandHandler::CPositionData());
+	Positions.back().PositionName = L"3";
+	Positions.back().Labware.push_back(CommandHandler::CLabwareData());
+	Positions.back().Labware.back().Barcode = L"Reihe 2";
+	Positions.back().Labware.back().Name = L"Plate 2";
+	Positions.back().Labware.back().SampleName = L"GC Probe3";
+	Positions.back().Labware.back().Vial = L"10";
+	Positions.back().Labware.back().Method_Path = L"C:\\MassHunter\\GCMS\\1\\methods";
+	Positions.back().Labware.back().Typ = L"Sample";
+	Positions.back().Labware.back().DataFile = L"";
+	Positions.back().Labware.back().Level = L"";
+	Positions.back().Labware.back().Dilution = L"1";
+	Positions.back().Labware.back().Volume = L"";
+	Positions.back().Labware.back().TrayName = L"";
+	Positions.back().Labware.back().Comment = L"";
+
+	
+	Positions.push_back(CommandHandler::CPositionData());
+	Positions.back().PositionName = L"4";
+	Positions.back().Labware.push_back(CommandHandler::CLabwareData());
+	Positions.back().Labware.back().Barcode = L"Reihe 2";
+	Positions.back().Labware.back().Name = L"Plate 2";
+	Positions.back().Labware.back().SampleName = L"GC Probe4";
+	Positions.back().Labware.back().Vial = L"11";
+	Positions.back().Labware.back().Method_Path = L"C:\\MassHunter\\GCMS\\1\\methods";
+	Positions.back().Labware.back().Typ = L"Cal";
+	Positions.back().Labware.back().DataFile = L"";
+	Positions.back().Labware.back().Level = L"1";
+	Positions.back().Labware.back().Dilution = L"1";
+	Positions.back().Labware.back().Volume = L"";
+	Positions.back().Labware.back().TrayName = L"";
+	Positions.back().Labware.back().Comment = L"";
+
+	
+	Positions.push_back(CommandHandler::CPositionData());
+	Positions.back().PositionName = L"5";
+	Positions.back().Labware.push_back(CommandHandler::CLabwareData());
+	Positions.back().Labware.back().Barcode = L"Reihe 2";
+	Positions.back().Labware.back().Name = L"Plate 2";
+	Positions.back().Labware.back().SampleName = L"GC Probe5";
+	Positions.back().Labware.back().Vial = L"12";
+	Positions.back().Labware.back().Method_Path = L"C:\\MassHunter\\GCMS\\1\\methods";
+	Positions.back().Labware.back().Typ = L"Sample";
+	Positions.back().Labware.back().DataFile = L"";
+	Positions.back().Labware.back().Level = L"";
+	Positions.back().Labware.back().Dilution = L"1";
+	Positions.back().Labware.back().Volume = L"";
+	Positions.back().Labware.back().TrayName = L"";
+	Positions.back().Labware.back().Comment = L"";
+
+	
+	Positions.push_back(CommandHandler::CPositionData());
+	Positions.back().PositionName = L"6";
+	Positions.back().Labware.push_back(CommandHandler::CLabwareData());
+	Positions.back().Labware.back().Barcode = L"Reihe 2";
+	Positions.back().Labware.back().Name = L"Plate 2";
+	Positions.back().Labware.back().SampleName = L"GC Probe6";
+	Positions.back().Labware.back().Vial = L"6";
+	Positions.back().Labware.back().Method_Path = L"C:\\MassHunter\\GCMS\\1\\methods";
+	Positions.back().Labware.back().Typ = L"Sample";
+	Positions.back().Labware.back().DataFile = L"";
+	Positions.back().Labware.back().Level = L"";
+	Positions.back().Labware.back().Dilution = L"1";
+	Positions.back().Labware.back().Volume = L"";
+	Positions.back().Labware.back().TrayName = L"";
+	Positions.back().Labware.back().Comment = L"";
+
+	
+	Positions.push_back(CommandHandler::CPositionData());
+	Positions.back().PositionName = L"7";
+	Positions.back().Labware.push_back(CommandHandler::CLabwareData());
+	Positions.back().Labware.back().Barcode = L"Reihe 2";
+	Positions.back().Labware.back().Name = L"Plate 2";
+	Positions.back().Labware.back().SampleName = L"GC Probe7";
+	Positions.back().Labware.back().Vial = L"7";
+	Positions.back().Labware.back().Method_Path = L"C:\\MassHunter\\GCMS\\1\\methods";
+	Positions.back().Labware.back().Typ = L"Sample";
+	Positions.back().Labware.back().DataFile = L"";
+	Positions.back().Labware.back().Level = L"";
+	Positions.back().Labware.back().Dilution = L"1";
+	Positions.back().Labware.back().Volume = L"";
+	Positions.back().Labware.back().TrayName = L"";
+	Positions.back().Labware.back().Comment = L"";
+
+
+
+	std::shared_ptr<CommandHandler::CBaseCommand> X(new CMethodCommand(Project, L"", Method, DataPath, Positions));
+	MassHunter.Peer->SendCommand(X, posix_time::seconds(10), std::bind(&CServiceClientDlg::MethodRunCommandComplete, this,
+																  std::placeholders::_1, std::placeholders::_2));
+}
+
+void CServiceClientDlg::MethodRunCommandComplete(boost::system::error_code Error, CommandHandler::CCommandOnTheFly* X)
+{
+	TRACE(L"CServiceClientDlg::MethodRunCommandComplete\n");
+	interprocess::scoped_lock<recursive_mutex> SL(m_Mutex);
+
+	if (Error)
+	{
+		SetInfoTextExtern(Utf8ToCString(Error.message()));
+	}
+	if (!X || X->Responses.empty())
+	{	SetInfoTextExtern(L"No CommandHandler::CCommandOnTheFly object or no responses");
+		return;
+	}
+	// first response should be ACK/NACK second could by Reply ...
+	CommandHandler::CBaseError* E = dynamic_cast<CommandHandler::CBaseError*>(X->Responses.back().get());
+	if (E)
+	{	// TODO use ErrorCode
+		if (!E->ErrorText.IsEmpty())
+		{	SetInfoTextExtern(L"Server: " + E->ErrorText);
+		}
+		return;
+	}
+	CMethodCommand* Y = dynamic_cast<CMethodCommand*>(X->Responses.back().get());
+	if (!Y)
+	{	SetInfoTextExtern(L"No CMethodCommand object");
+		return;
+	}
+	if (Y->Success) SetInfoTextExtern(L"Automatisierte Prozess des MassHunter ist angefangen");
+	else SetInfoTextExtern(L"Server: " + Y->ErrorText);
+}
+
+
+void CServiceClientDlg::OnBnClickedGetStatus()
+{
+	
+		TRACE(L"CServiceClientDlg::OnBnClickedGetStatus\n");
+		if (!MassHunter.Peer) return;
+
+		SetInfoText(L"Requesting MassHunter status ..");
+
+		std::shared_ptr<CommandHandler::CBaseCommand> X(new CResourceStatusCommand());
+		MassHunter.Peer->SendCommand(X, boost::posix_time::seconds(10),
+			std::bind(&CServiceClientDlg::StatusCommandComplete, this,
+				std::placeholders::_1, std::placeholders::_2));
+}
+
+
+
+
+void CServiceClientDlg::StatusCommandComplete(boost::system::error_code Error, CommandHandler::CCommandOnTheFly* X)
+{
+	TRACE(L"CServiceClientDlg::StatusCommandComplete\n");
+	interprocess::scoped_lock<recursive_mutex> SL(m_Mutex);
+
+	if (Error)
+	{
+		SetInfoTextExtern(Utf8ToCString(Error.message()));
+		return;
+	}
+	if (!X || X->Responses.empty())
+	{
+		SetInfoTextExtern(L"No CommandHandler::CCommandOnTheFly object or no responses");
+		return;
+	}
+
+	if (MassHunter::CResourceStatusCommand* MC = dynamic_cast<MassHunter::CResourceStatusCommand*>(X->Responses.front().get()))
+	{
+		if (MC->Success)
+		{
+			if (!MC->List.empty())
+			{
+				CommandHandler::CBaseResourceStatusInfo* MI = dynamic_cast<CommandHandler::CBaseResourceStatusInfo*>(MC->List.front().get());
+				if (MI)
+				{
+					// Zeige Status in GUI
+					m_StatusBox.SetWindowText(MI->StatusAsText);
+
+					SetInfoTextExtern(MI->StatusAsText);
+
+
+					// Optional: auch in einer Listbox anzeigen, wenn gewünscht
+					// StatusList.InsertItemExtern(0, MI->StatusAsText);
+				}
+				else
+				{
+					m_StatusBox.SetWindowText(L"Invalid Status info received");
+				}
+			}
+			else
+			{
+				m_StatusBox.SetWindowText(L"Empty Status list");
+			}
+		}
+		else
+		{
+			m_StatusBox.SetWindowText(MC->ErrorText);
+		}
+	}
+	else
+	{
+		m_StatusBox.SetWindowText(L"Response is not of type CResourceStatusCommand");
+	}
+
+	//SetInfoTextExtern(L"Status command complete");
+}
+
+
+
+
+
+
+
